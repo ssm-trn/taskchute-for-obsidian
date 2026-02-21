@@ -2,6 +2,7 @@ import { Notice, TFile, TAbstractFile } from 'obsidian'
 import type { App, CachedMetadata } from 'obsidian'
 import RoutineService from '../../routine/services/RoutineService'
 import { getScheduledTime } from '../../../utils/fieldMigration'
+import { normalizeReminderTime } from '../../reminder/services/ReminderFrontmatterService'
 import {
   DayState,
   DeletedInstance,
@@ -72,6 +73,7 @@ export interface TaskLoaderHost {
   plugin: {
     settings: { slotKeys?: Record<string, string> }
     pathManager: PathManagerLike
+    saveSettings?: () => Promise<void>
   }
   dayStateManager: DayStateStoreService
   tasks: TaskData[]
@@ -150,16 +152,58 @@ function getSlotOverrideValue(
   return { value: legacy, migrated: false }
 }
 
-function getStoredSlotKey(
+function migrateSlotOverrideMetaKey(
+  dayState: DayState,
+  taskId: string | undefined,
+  path: string,
+  slotKey: string | undefined,
+): void {
+  if (!taskId || !slotKey) {
+    return
+  }
+
+  const legacyUpdatedAt = dayState.slotOverridesMeta?.[path]?.updatedAt
+  const existingTaskUpdatedAt = dayState.slotOverridesMeta?.[taskId]?.updatedAt
+  const migratedUpdatedAt = typeof legacyUpdatedAt === 'number' && Number.isFinite(legacyUpdatedAt)
+    ? legacyUpdatedAt
+    : (typeof existingTaskUpdatedAt === 'number' && Number.isFinite(existingTaskUpdatedAt) ? existingTaskUpdatedAt : 0)
+
+  if (!dayState.slotOverridesMeta) {
+    dayState.slotOverridesMeta = {}
+  }
+  dayState.slotOverridesMeta[taskId] = {
+    slotKey,
+    updatedAt: migratedUpdatedAt,
+  }
+
+  if (taskId !== path) {
+    delete dayState.slotOverridesMeta[path]
+  }
+}
+
+function consumeStoredSlotKey(
   slotKeys: Record<string, string> | undefined,
   taskId: string | undefined,
   path: string,
-): string | undefined {
-  if (!slotKeys) return undefined
+) : { value?: string; mutated: boolean } {
+  if (!slotKeys) return { mutated: false }
+
   if (taskId && typeof slotKeys[taskId] === 'string') {
-    return slotKeys[taskId]
+    const value = slotKeys[taskId]
+    delete slotKeys[taskId]
+    if (taskId !== path && typeof slotKeys[path] === 'string') {
+      delete slotKeys[path]
+    }
+    return { value, mutated: true }
   }
-  return slotKeys[path]
+
+  if (typeof slotKeys[path] === 'string') {
+    const value = slotKeys[path]
+    delete slotKeys[path]
+    return { value, mutated: true }
+  }
+
+  return { mutated: false }
 }
 
 function resolveCreatedMillis(file: TFile | null | undefined, fallback?: number): number | undefined {
@@ -231,14 +275,22 @@ export async function loadTasksForContext(context: TaskLoaderHost): Promise<void
       const content = await context.app.vault.read(file)
       if (!isTaskFile(content, frontmatter)) continue
 
-      if (frontmatter?.isRoutine === true) {
+      const isActiveRoutine = frontmatter?.isRoutine === true &&
+        (frontmatter as Record<string, unknown>).routine_enabled !== false
+
+      if (isActiveRoutine) {
         if (shouldShowRoutineTask(frontmatter, dateKey)) {
           await createRoutineTask(context, file, frontmatter, dateKey)
         }
       } else {
-        const shouldShow = await shouldShowNonRoutineTask(context, file, frontmatter, dateKey)
+        let shouldShow: boolean
+        if (frontmatter?.isRoutine === true) {
+          shouldShow = await shouldShowDisabledRoutineTask(context, file, frontmatter, dateKey)
+        } else {
+          shouldShow = await shouldShowNonRoutineTask(context, file, frontmatter, dateKey)
+        }
         if (shouldShow) {
-          createNonRoutineTask(context, file, frontmatter, dateKey)
+          await createNonRoutineTask(context, file, frontmatter, dateKey)
         }
       }
     }
@@ -312,6 +364,7 @@ function createTaskFromExecutions(
   }
 
   const metadata = file ? getFrontmatter(context, file) : undefined
+  const isRoutineTask = metadata?.isRoutine === true
   const projectInfo = resolveProjectInfo(context, metadata)
   const templateName = file?.basename ?? executions[0].taskTitle
   const derivedPath = file?.path ?? (executions[0].taskPath || `${templateName}.md`)
@@ -327,12 +380,15 @@ function createTaskFromExecutions(
     project: toStringField(metadata?.project),
     projectPath: projectInfo?.path,
     projectTitle: projectInfo?.title,
-    isRoutine: metadata?.isRoutine === true,
+    isRoutine: isRoutineTask,
     createdMillis,
-    routine_type: metadata?.routine_type,
-    routine_interval: typeof metadata?.routine_interval === 'number' ? metadata.routine_interval : undefined,
+    routine_type: isRoutineTask ? metadata?.routine_type : undefined,
+    routine_interval: isRoutineTask && typeof metadata?.routine_interval === 'number'
+      ? metadata.routine_interval
+      : undefined,
     routine_enabled: metadata?.routine_enabled,
     scheduledTime: getScheduledTime(metadata) || undefined,
+    reminder_time: normalizeReminderTime(metadata?.reminder_time),
     taskId,
   }
 
@@ -363,12 +419,13 @@ function createTaskFromExecutions(
   return created > 0
 }
 
-function createNonRoutineTask(
+async function createNonRoutineTask(
   context: TaskLoaderHost,
   file: TFile,
   metadata: TaskFrontmatterWithLegacy | undefined,
   dateKey: string,
-): void {
+): Promise<void> {
+  const isRoutineTask = metadata?.isRoutine === true
   const projectInfo = resolveProjectInfo(context, metadata)
   const createdMillis = resolveCreatedMillis(file, Date.now())
   const taskId = resolveTaskId(metadata)
@@ -381,16 +438,75 @@ function createNonRoutineTask(
     project: toStringField(metadata?.project),
     projectPath: projectInfo?.path,
     projectTitle: projectInfo?.title,
-    isRoutine: false,
+    isRoutine: isRoutineTask,
     createdMillis,
+    routine_type: isRoutineTask ? metadata?.routine_type : undefined,
+    routine_interval: isRoutineTask && typeof metadata?.routine_interval === 'number'
+      ? metadata.routine_interval
+      : undefined,
+    routine_enabled: isRoutineTask ? metadata?.routine_enabled : undefined,
     scheduledTime: getScheduledTime(metadata) || undefined,
-    reminder_time: metadata?.reminder_time,
+    reminder_time: normalizeReminderTime(metadata?.reminder_time),
     taskId,
   }
 
   context.tasks.push(taskData)
 
-  const rawStoredSlot = getStoredSlotKey(context.plugin.settings.slotKeys, taskId, file.path)
+  let rawStoredSlot: string | undefined
+  if (isRoutineTask) {
+    const dayState = await ensureDayState(context, dateKey)
+    const { value: dayStateSlot, migrated } = getSlotOverrideValue(dayState.slotOverrides, taskId, file.path)
+    rawStoredSlot = dayStateSlot
+    if (migrated) {
+      migrateSlotOverrideMetaKey(dayState, taskId, file.path, dayStateSlot)
+      await context.dayStateManager?.persist(dateKey)
+    }
+  } else {
+    const dayState = await ensureDayState(context, dateKey)
+    const { value: dayStateSlot, migrated } = getSlotOverrideValue(dayState.slotOverrides, taskId, file.path)
+    rawStoredSlot = dayStateSlot
+    if (migrated) {
+      migrateSlotOverrideMetaKey(dayState, taskId, file.path, dayStateSlot)
+    }
+
+    let shouldPersistDayState = migrated
+    let shouldPersistSettings = false
+
+    if (!rawStoredSlot) {
+      const legacyStoredSlot = consumeStoredSlotKey(context.plugin.settings.slotKeys, taskId, file.path)
+      if (legacyStoredSlot.value) {
+        const sectionConfig = context.getSectionConfig()
+        const normalizedLegacySlot = sectionConfig.isValidSlotKey(legacyStoredSlot.value)
+          ? legacyStoredSlot.value
+          : sectionConfig.migrateSlotKey(legacyStoredSlot.value)
+        const overrideKey = taskId ?? file.path
+        dayState.slotOverrides[overrideKey] = normalizedLegacySlot
+        if (taskId && file.path && overrideKey !== file.path) {
+          delete dayState.slotOverrides[file.path]
+        }
+        if (!dayState.slotOverridesMeta) {
+          dayState.slotOverridesMeta = {}
+        }
+        dayState.slotOverridesMeta[overrideKey] = {
+          slotKey: normalizedLegacySlot,
+          updatedAt: Date.now(),
+        }
+        if (taskId && file.path && overrideKey !== file.path) {
+          delete dayState.slotOverridesMeta[file.path]
+        }
+        rawStoredSlot = normalizedLegacySlot
+        shouldPersistDayState = true
+      }
+      shouldPersistSettings = legacyStoredSlot.mutated
+    }
+
+    if (shouldPersistDayState) {
+      await context.dayStateManager?.persist(dateKey)
+    }
+    if (shouldPersistSettings && typeof context.plugin.saveSettings === 'function') {
+      await context.plugin.saveSettings()
+    }
+  }
   const storedSlot = rawStoredSlot && context.getSectionConfig().isValidSlotKey(rawStoredSlot) ? rawStoredSlot : undefined
   const slotKey = storedSlot ?? context.getSectionConfig().calculateSlotKeyFromTime(getScheduledTime(metadata) || undefined) ?? DEFAULT_SLOT_KEY
   const instance: TaskInstance = {
@@ -542,7 +658,7 @@ async function createRoutineTask(
     routine_weeks: normalizeRoutineWeeks(metadata),
     routine_weekdays: normalizeRoutineWeekdays(metadata),
     scheduledTime: getScheduledTime(metadata) || undefined,
-    reminder_time: metadata.reminder_time,
+    reminder_time: normalizeReminderTime(metadata.reminder_time),
     taskId,
   }
 
@@ -578,6 +694,94 @@ function shouldShowRoutineTask(
     : undefined
   const rule = RoutineService.parseFrontmatter(metadata)
   return RoutineService.isDue(dateKey, rule, movedTargetDate)
+}
+
+async function shouldShowDisabledRoutineTask(
+  context: TaskLoaderHost,
+  file: TFile,
+  metadata: TaskFrontmatterWithLegacy | undefined,
+  dateKey: string,
+): Promise<boolean> {
+  const originalEntries = getDeletedInstancesForDate(context, dateKey)
+  const taskId = resolveTaskId(metadata)
+  let deletedEntries = originalEntries
+
+  if (taskId) {
+    const promoted = promoteDeletedEntriesToTaskId(originalEntries, taskId, file.path)
+    if (promoted) {
+      deletedEntries = promoted
+      context.dayStateManager.setDeleted(promoted, dateKey)
+    }
+  }
+
+  // 1a. taskId-based permanent deletion check
+  if (taskId) {
+    const hasTaskIdDeletion = deletedEntries.some(
+      (entry) =>
+        entry.deletionType === 'permanent' &&
+        entry.taskId === taskId &&
+        (isDeletedEntry(entry) || isLegacyDeletionEntry(entry)),
+    )
+    if (hasTaskIdDeletion) return false
+  }
+
+  // 1b. legacy path-based permanent deletion check (for old data without taskId)
+  const legacyPathDeletions = deletedEntries.filter((entry) => {
+    if (entry.deletionType !== 'permanent') return false
+    if (entry.taskId) return false
+    if (entry.path !== file.path) return false
+    return isDeletedEntry(entry) || isLegacyDeletionEntry(entry)
+  })
+
+  if (legacyPathDeletions.length > 0) {
+    let missingDeletionTimestamp = false
+    let latestDeletionTimestamp: number | undefined
+    for (const entry of legacyPathDeletions) {
+      const ts = getEffectiveDeletedAt(entry)
+      if (ts > 0) {
+        latestDeletionTimestamp =
+          latestDeletionTimestamp === undefined
+            ? ts
+            : Math.max(latestDeletionTimestamp, ts)
+      } else {
+        missingDeletionTimestamp = true
+      }
+    }
+
+    if (missingDeletionTimestamp) return false
+
+    try {
+      const stats = await context.app.vault.adapter.stat(file.path)
+      if (!stats) return false
+      const raw = stats.ctime ?? stats.mtime
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) return false
+      if (latestDeletionTimestamp === undefined || raw <= latestDeletionTimestamp) return false
+
+      // Clean up stale legacy deletion entries
+      const remainingEntries = deletedEntries.filter((entry) => {
+        if (entry.deletionType !== 'permanent') return true
+        if (entry.taskId) return true
+        if (!isDeletedEntry(entry)) return true
+        return entry.path !== file.path
+      })
+      if (remainingEntries.length !== deletedEntries.length) {
+        context.dayStateManager.setDeleted(remainingEntries, dateKey)
+        deletedEntries = remainingEntries
+      }
+    } catch {
+      return false
+    }
+  }
+
+  // 2. If target_date exists, show only on that date
+  const metaRecord = metadata as Record<string, unknown> | undefined
+  const targetDate = metaRecord?.['target_date'] as string | undefined
+  if (targetDate) {
+    return targetDate === dateKey
+  }
+
+  // 3. Fallback for existing data without target_date: show on today only
+  return dateKey === formatDate(new Date())
 }
 
 async function shouldShowNonRoutineTask(
@@ -734,6 +938,7 @@ async function addDuplicatedInstances(context: TaskLoaderHost, dateKey: string):
               projectTitle: projectInfo?.title,
               isRoutine: metadata.isRoutine === true,
               scheduledTime: getScheduledTime(metadata) || undefined,
+              reminder_time: normalizeReminderTime(metadata.reminder_time),
               taskId: record.originalTaskId ?? resolveTaskId(metadata),
             }
           }
@@ -882,25 +1087,6 @@ function migrateDayStateSlotKeys(context: TaskLoaderHost, state: DayState): bool
   }
 
   return mutated
-}
-
-function shouldReplaceOrder(
-  existingMeta: { order: number; updatedAt: number } | undefined,
-  incomingMeta: { order: number; updatedAt: number } | undefined,
-  existingOrder: number,
-  incomingOrder: number,
-): boolean {
-  // Case 1: both have meta → compare updatedAt, then order
-  if (existingMeta && incomingMeta) {
-    if (incomingMeta.updatedAt > existingMeta.updatedAt) return true
-    if (incomingMeta.updatedAt === existingMeta.updatedAt && incomingOrder < existingOrder) return true
-    return false
-  }
-  // Case 2: only one has meta → meta-having side wins
-  if (incomingMeta && !existingMeta) return true
-  if (!incomingMeta && existingMeta) return false
-  // Case 3: neither has meta → smaller order wins
-  return incomingOrder < existingOrder
 }
 
 function getDeletedInstancesForDate(context: TaskLoaderHost, dateKey: string): DeletedInstance[] {
@@ -1095,22 +1281,6 @@ function deriveTitleFromPath(path: string | undefined): string | undefined {
     return undefined
   }
   return filename.endsWith('.md') ? filename.slice(0, -3) : filename
-}
-
-function calculateSlotKeyFromTime(time: string | undefined): string | undefined {
-  if (!time) return undefined
-  const [hourStr] = time.split(':')
-  const hour = Number.parseInt(hourStr ?? '', 10)
-  if (Number.isNaN(hour)) return undefined
-  if (hour >= 0 && hour < 8) return '0:00-8:00'
-  if (hour >= 8 && hour < 12) return '8:00-12:00'
-  if (hour >= 12 && hour < 16) return '12:00-16:00'
-  if (hour >= 16 && hour < 24) return '16:00-0:00'
-  return undefined
-}
-
-function getScheduledSlotKey(time: string | undefined): string | undefined {
-  return calculateSlotKeyFromTime(time)
 }
 
 function parseDateTime(time: string | undefined, dateKey: string): Date | undefined {
